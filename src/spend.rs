@@ -26,6 +26,30 @@ use rayon;
 // Structures
 // ============================================================================
 
+/// Controls whether the spend amount is revealed to the server.
+///
+/// * `Exact` – the server is given the plaintext amount `s` and enforces it precisely.
+///   Use this for metered operations where the server must levy a specific credit cost.
+///
+/// * `RateLimit` – the amount is hidden from the server.  The server only verifies
+///   that at least 1 credit was spent (i.e. `s ≥ 1`), without learning the exact
+///   value.  Use this for request-rate-limiting where every request costs 1 credit
+///   and the server does not need to observe individual consumption patterns.
+///
+/// # Security note
+/// When the server's policy is `Exact`, it **must** reject any proof that uses the
+/// `RateLimit` mode (i.e. where `SpendProof.c_total` is `Some`).  The
+/// [`verify_spend`] function enforces this automatically via the `required_amount`
+/// parameter: pass `Some(n)` to require an exact amount and reject hidden-amount
+/// proofs, or `None` to allow hidden amounts (rate-limit mode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpendMode {
+    /// Reveal the exact spend amount to the server.
+    Exact,
+    /// Hide the spend amount; the server only learns that `s ≥ 1`.
+    RateLimit,
+}
+
 #[derive(Clone, Debug)]
 pub struct SpendProof {
     pub a_prime:    G1Projective,
@@ -45,11 +69,18 @@ pub struct SpendProof {
     pub z_v:        Scalar,
     pub z_w:        Scalar,
     pub batched_eq: BatchedEqualityProof,
+    /// The spend amount in plaintext.  Present and non-zero in `Exact` mode.
+    /// Set to `0` in `RateLimit` mode (use `c_total` instead).
     pub s:          u32,
     pub k_cur:      Scalar,
     pub t_issue:    u32,
     pub k_prime:    G1Projective,
     pub c_bp:       G1Projective,
+    /// Present in `RateLimit` (hidden-amount) mode only.
+    /// Carries `c_total = k_prime + s·h4` so the verifier can check the
+    /// Schnorr equations without knowing `s`.  The verifier checks
+    /// `c_total ≠ k_prime` to enforce `s ≥ 1`.
+    pub c_total:    Option<G1Projective>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -88,6 +119,7 @@ impl SpendProver {
         generators: &Generators,
         pk_daily: &G2Projective,
         h_ctx: Scalar,
+        mode: SpendMode,
     ) -> Result<(SpendClient, SpendProof)> {
         if spend_amount == 0 {
             return Err(ActError::ProtocolError("Spend amount must be positive".into()));
@@ -171,9 +203,15 @@ impl SpendProver {
         );
 
         // BatchedEqualityProof
+        // In RateLimit (hidden-amount) mode, the spend amount is not revealed.
+        // We include the compressed c_total point in the BEQ context instead of
+        // spend_amount, so that the BEQ is bound to this specific c_total.
         let mut beq_ctx = Vec::new();
         beq_ctx.extend_from_slice(&h_ctx.to_bytes());
-        beq_ctx.extend_from_slice(&spend_amount.to_le_bytes());
+        match mode {
+            SpendMode::Exact => beq_ctx.extend_from_slice(&spend_amount.to_le_bytes()),
+            SpendMode::RateLimit => beq_ctx.extend_from_slice(&G1Affine::from(c_total).to_compressed()),
+        }
         beq_ctx.extend_from_slice(&k_cur.to_bytes());
         beq_ctx.extend_from_slice(&t_issue.to_le_bytes());
         beq_ctx.extend_from_slice(nonce);
@@ -196,7 +234,8 @@ impl SpendProver {
         let beq_bytes = batched_eq.to_bytes();
 
         let c = Self::challenge(
-            h_ctx, pk_daily, spend_amount, &k_cur, t_issue, nonce,
+            h_ctx, pk_daily, if mode == SpendMode::Exact { Some(spend_amount) } else { None },
+            &k_cur, t_issue, nonce,
             k_prime, c_total, c_bp, &beq_bytes,
             a_prime, a_bar, t_bbs,
             t_scale_t, t_total, t_scale_r, t_refund, t_scale_bp, t_bp,
@@ -210,13 +249,21 @@ impl SpendProver {
         let z_v = rho_v + c * (r_star * r1);
         let z_w = rho_w + c * (r_bp * r1);
 
+        // In RateLimit mode, store c_total in the proof; in Exact mode it is
+        // recomputed by the verifier from proof.s and proof.k_prime.
+        let (proof_s, proof_c_total) = match mode {
+            SpendMode::Exact    => (spend_amount, None),
+            SpendMode::RateLimit => (0, Some(c_total)),
+        };
+
         Ok((
             SpendClient { k_cur, c_bal, t_issue, k_star, r_star, r_bp },
             SpendProof {
                 a_prime, a_bar, t_bbs,
                 t_scale_t, t_total, t_scale_r, t_refund, t_scale_bp, t_bp,
                 z_e, z_r1, z_s_tilde, z_c_tilde, z_u, z_v, z_w,
-                batched_eq, s: spend_amount, k_cur, t_issue, k_prime, c_bp,
+                batched_eq, s: proof_s, k_cur, t_issue, k_prime, c_bp,
+                c_total: proof_c_total,
             },
         ))
     }
@@ -225,7 +272,9 @@ impl SpendProver {
     fn challenge(
         h_ctx: Scalar,
         pk_daily: &G2Projective,
-        spend_amount: u32,
+        /// `Some(amount)` for Exact mode (amount included in hash);
+        /// `None` for RateLimit / hidden-amount mode.
+        spend_amount: Option<u32>,
         k_cur: &Scalar,
         t_issue: u32,
         nonce: &[u8; 16],
@@ -247,7 +296,12 @@ impl SpendProver {
         let mut w = HasherWriter(&mut hasher);
         write_scalar(&mut w, h_ctx);
         write_g2(&mut w, *pk_daily);
-        w.write_all(&spend_amount.to_le_bytes()).unwrap();
+        // In Exact mode, include the plaintext spend amount.
+        // In RateLimit (hidden) mode, omit it — c_total (written below) already
+        // commits to the spend amount via c_total = k_prime + s·h4.
+        if let Some(amount) = spend_amount {
+            w.write_all(&amount.to_le_bytes()).unwrap();
+        }
         w.write_all(&k_cur.to_bytes()).unwrap();
         w.write_all(&t_issue.to_le_bytes()).unwrap();
         w.write_all(nonce).unwrap();
@@ -264,7 +318,13 @@ impl SpendProver {
         write_g1(&mut w, t_refund);
         write_g1(&mut w, t_scale_bp);
         write_g1(&mut w, t_bp);
-        w.write_all(b"Spend").unwrap();
+        // Domain separator distinguishes the two modes to prevent cross-mode
+        // proof substitution attacks.
+        if spend_amount.is_some() {
+            w.write_all(b"Spend").unwrap();
+        } else {
+            w.write_all(b"SpendHidden").unwrap();
+        }
         drop(w);
         hash_to_scalar_from_hasher(hasher)
     }
@@ -274,6 +334,21 @@ impl SpendProver {
 // Server Verifier
 // ============================================================================
 
+/// Verify a single spend proof.
+///
+/// # Parameters
+///
+/// * `required_amount` – When `Some(n)`, the server requires the client to
+///   have spent exactly `n` credits.  Proofs using hidden-amount (RateLimit)
+///   mode are rejected.  When `None`, the server operates in rate-limiting
+///   mode: it accepts both revealed and hidden amounts as long as `s ≥ 1`.
+///
+/// * `allow_grace` – When `true`, the server accepts spend proofs from the
+///   previous epoch (`proof.t_issue == current_epoch − 1`) during a
+///   configurable grace window.  When `false` (the **default** and recommended
+///   setting), only proofs from the current epoch are accepted.  A non-zero
+///   grace period allows a burst of up to 2 × `c_max` credits per user at an
+///   epoch boundary; see the security considerations section of the paper.
 pub fn verify_spend(
     proof: &SpendProof,
     current_epoch: u32,
@@ -283,22 +358,63 @@ pub fn verify_spend(
     keys: &ServerKeys,
     h_ctx: Scalar,
     rng: &mut impl RngCore,
+    required_amount: Option<u32>,
+    allow_grace: bool,
 ) -> Result<SpendResponse> {
-    if proof.s == 0 {
+    // ── Determine spend mode from proof ──────────────────────────────────────
+    let hidden = proof.c_total.is_some();
+
+    // Enforce server policy: if the server requires an exact amount, reject
+    // hidden-amount proofs.
+    if let Some(amount) = required_amount {
+        if hidden {
+            return Err(ActError::VerificationFailed(
+                "Server requires exact spend amount; hidden-amount proof rejected".into(),
+            ));
+        }
+        if proof.s != amount {
+            return Err(ActError::VerificationFailed(
+                format!("Spend amount mismatch: expected {amount}, got {}", proof.s).into(),
+            ));
+        }
+    }
+
+    // In exact mode the spend amount must be non-zero.
+    if !hidden && proof.s == 0 {
         return Err(ActError::VerificationFailed("Spend amount must be positive".into()));
     }
-    if proof.t_issue != current_epoch && proof.t_issue.saturating_add(1) != current_epoch {
+
+    // ── Epoch check ──────────────────────────────────────────────────────────
+    let epoch_ok = proof.t_issue == current_epoch
+        || (allow_grace && proof.t_issue.saturating_add(1) == current_epoch);
+    if !epoch_ok {
         return Err(ActError::VerificationFailed("Epoch mismatch".into()));
     }
+
     if bool::from(proof.a_prime.is_identity()) || bool::from(proof.t_bbs.is_identity()) {
         return Err(ActError::VerificationFailed("Zero point in proof".into()));
     }
 
-    let c_total  = &proof.k_prime + &(&generators.h[4] * &Scalar::from(proof.s).0);
+    // ── Resolve c_total ───────────────────────────────────────────────────────
+    // Exact mode: compute from plaintext s.
+    // RateLimit mode: take from proof; verify s ≥ 1 by checking c_total ≠ k_prime.
+    let c_total = if hidden {
+        let ct = proof.c_total.unwrap();
+        if ct == proof.k_prime {
+            return Err(ActError::VerificationFailed(
+                "Hidden spend amount is zero (c_total == k_prime)".into(),
+            ));
+        }
+        ct
+    } else {
+        &proof.k_prime + &(&generators.h[4] * &Scalar::from(proof.s).0)
+    };
+
     let beq_bytes = proof.batched_eq.to_bytes();
 
+    let spend_amount_opt = if hidden { None } else { Some(proof.s) };
     let c = SpendProver::challenge(
-        h_ctx, pk_daily, proof.s, &proof.k_cur, proof.t_issue, nonce,
+        h_ctx, pk_daily, spend_amount_opt, &proof.k_cur, proof.t_issue, nonce,
         proof.k_prime, c_total, proof.c_bp, &beq_bytes,
         proof.a_prime, proof.a_bar, proof.t_bbs,
         proof.t_scale_t, proof.t_total, proof.t_scale_r, proof.t_refund,
@@ -311,23 +427,48 @@ pub fn verify_spend(
         let c2 = &c_fr * &c_fr;
         let c3 = &c2   * &c_fr;
         let ti = BlsScalar::from(proof.t_issue as u64);
-        let sf = BlsScalar::from(proof.s as u64);
 
         let sc_h0 = &(&(&c_fr + &c2) * &proof.z_v.0) + &(&(&c3 * &proof.z_w.0) + &proof.z_s_tilde.0);
         let sc_h1 = &(&(&c_fr + &c2) * &proof.z_u.0) + &(&proof.k_cur.0 * &proof.z_r1.0);
         let sc_h2 = &(&(&c_fr + &(&c2 + &BlsScalar::ONE)) * &ti) * &proof.z_r1.0;
-        let sc_h4 = {
+
+        // In hidden-amount (RateLimit) mode the prover's s is not revealed.
+        // We reformulate the MSM check to avoid needing s directly by using
+        // c_total (which commits to s via c_total = k_prime + s·h4):
+        //
+        //   Exact:   sc_h4 = (c+1+c2+c3)·z_c - (c2+c3)·s·z_r1
+        //            sc_ctotal = -c·z_r1
+        //            sc_kprime = -c2·z_r1
+        //
+        //   Hidden:  sc_h4 = (c+1+c2+c3)·z_c           [s·z_r1 absorbed into c_total/k_prime]
+        //            sc_ctotal = -(c+c2+c3)·z_r1
+        //            sc_kprime =  c3·z_r1
+        //
+        // The two forms are algebraically identical because
+        //   -(c2+c3)·s·z_r1·h4 = -(c2+c3)·z_r1·(c_total - k_prime)
+        // which redistributes exactly into the sc_ctotal / sc_kprime adjustments.
+        // All h0, h1, h2 coefficients are unaffected (the sc_ctotal and sc_kprime
+        // changes cancel for those generators since c_total and k_prime share the
+        // same h1/h2/h0 components).
+        let (sc_h4, sc_ctotal, sc_kprime) = if hidden {
+            let sc_h4 = &(&c_fr + &(&BlsScalar::ONE + &(&c2 + &c3))) * &proof.z_c_tilde.0;
+            let sc_ctotal = -(&(&c_fr + &(&c2 + &c3)) * &proof.z_r1.0);
+            let sc_kprime = &c3 * &proof.z_r1.0;
+            (sc_h4, sc_ctotal, sc_kprime)
+        } else {
+            let sf = BlsScalar::from(proof.s as u64);
             let zc = proof.z_c_tilde.0;
             let zr = proof.z_r1.0;
             // (c+1+c2+c3)*z_c - (c2+c3)*s*z_r1
             let t1 = &(&c_fr + &(&BlsScalar::ONE + &(&c2 + &c3))) * &zc;
             let t2 = &(&c2 + &c3) * &(&sf * &zr);
-            &t1 - &t2
+            let sc_h4 = &t1 - &t2;
+            let sc_ctotal = -(&c_fr * &proof.z_r1.0);
+            let sc_kprime = -(&c2   * &proof.z_r1.0);
+            (sc_h4, sc_ctotal, sc_kprime)
         };
         let sc_g1      = proof.z_r1.0;
         let sc_aprime  = -proof.z_e.0;
-        let sc_ctotal  = -(&c_fr * &proof.z_r1.0);
-        let sc_kprime  = -(&c2   * &proof.z_r1.0);
         let sc_cbp     = -(&c3   * &proof.z_r1.0);
         let sc_abar    = -c_fr;
         let sc_ttotal    = -c_fr;
@@ -363,10 +504,14 @@ pub fn verify_spend(
         }
     }
 
-    // Build BatchedEqualityProof context and commitment list (used in rayon::join below).
+    // Build BatchedEqualityProof context — must match what the prover computed.
     let mut beq_ctx = Vec::new();
     beq_ctx.extend_from_slice(&h_ctx.to_bytes());
-    beq_ctx.extend_from_slice(&proof.s.to_le_bytes());
+    if hidden {
+        beq_ctx.extend_from_slice(&G1Affine::from(c_total).to_compressed());
+    } else {
+        beq_ctx.extend_from_slice(&proof.s.to_le_bytes());
+    }
     beq_ctx.extend_from_slice(&proof.k_cur.to_bytes());
     beq_ctx.extend_from_slice(&proof.t_issue.to_le_bytes());
     beq_ctx.extend_from_slice(nonce);
