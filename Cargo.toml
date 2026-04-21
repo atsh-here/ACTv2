@@ -1,0 +1,77 @@
+[package]
+name = "act"
+version = "0.1.0"
+edition = "2021"
+authors = ["ACT Protocol Developers"]
+description = "Anonymous Credit Tokens – privacy-preserving rate-limited credentials"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/act"
+readme = "README.md"
+keywords = ["cryptography", "privacy", "credentials", "zkp", "bbs"]
+categories = ["cryptography", "web-programming::http-client"]
+
+[features]
+default = ["std"]
+std = ["dep:rayon"]
+server = ["dep:redis", "dep:tokio", "dep:axum", "dep:bincode", "dep:tower", "dep:tower-http"]
+
+[dependencies]
+# blstrs: Rust wrapper for the blst C/ASM BLS12-381 library (industry-standard speed)
+blstrs = "0.7"
+# Pairing-friendly curve abstractions (Engine, MultiMillerLoop)
+pairing = "0.23"
+# Generic group / field traits that blstrs implements
+group = "0.13"
+ff = "0.13"
+
+# Fast CSPRNG: seed once from OsRng, use ChaCha20 stream for all blinders
+rand_chacha = "0.3"
+
+# Dalek Bulletproofs on Curve25519 (for spend-phase range proofs via dual-curve bridge)
+# v5 moves back to the official curve25519-dalek v4 crate whose SIMD backend
+# compiles on stable Rust (uses std::arch instead of nightly packed_simd).
+bulletproofs = { version = "5.0.0", default-features = false, features = ["std"] }
+# Official curve25519-dalek v4 (required by bulletproofs 5).  AVX2 SIMD is
+# activated automatically when built with RUSTFLAGS="-C target-cpu=native".
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc"] }
+merlin = { version = "3", default-features = false }
+
+# Parallel verification tail (rayon::join for Bulletproof + pairing checks)
+rayon = { version = "1.10", optional = true }
+
+# Hashing – enable hardware SHA-256 intrinsics where available
+sha2 = { version = "0.10", default-features = false, features = ["asm"] }
+
+# Randomness
+rand = { version = "0.8", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+
+# Serialization
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+hex = { version = "0.4", default-features = false, features = ["alloc", "serde"] }
+bincode = { version = "1.3", optional = true }
+
+# Error handling
+thiserror = { version = "1.0", default-features = false }
+
+# Server dependencies (feature-gated)
+redis = { version = "0.23", features = ["tokio-comp", "tokio-native-tls-comp"], optional = true }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "sync"], optional = true }
+axum = { version = "0.7", optional = true }
+tower = { version = "0.4", optional = true }
+tower-http = { version = "0.5", features = ["cors"], optional = true }
+
+[dev-dependencies]
+rand = "0.8"
+tokio = { version = "1.0", features = ["rt", "macros"] }
+redis = { version = "0.23", features = ["tokio-comp"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+overflow-checks = false
