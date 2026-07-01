@@ -12,12 +12,14 @@ use blstrs::{G1Projective, Scalar as BlsScalar};
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar as RistrettoScalar;
 
+use crate::epoch_refresh::{refresh_emax_bls_commitment, RefreshProof};
 use crate::error::{ActError, Result};
-use crate::v3_zkp::gap::ServerPublicKey;
-use crate::v3_zkp::prover::{TimedProof, create_non_membership_proof_timed, verify_non_membership_proof_timed};
 use crate::setup::Generators;
-use crate::epoch_refresh::{RefreshProof, refresh_emax_bls_commitment};
-use crate::spend::{SpendProof, spend_emax_bls_commitment};
+use crate::spend::{spend_emax_bls_commitment, SpendProof};
+use crate::v3_zkp::gap::ServerPublicKey;
+use crate::v3_zkp::prover::{
+    create_non_membership_proof_timed, verify_non_membership_proof_timed, TimedProof,
+};
 
 /// Maximum width supported by the current 64-bit gap range proof.
 pub const MAX_GAP_WIDTH_V1: u64 = u64::MAX - 1;
@@ -55,7 +57,9 @@ pub struct GapWitnessInputs {
 pub fn validate_gap_interval(emax: u64, interval: (u64, u64), now_unix: u64) -> Result<()> {
     let (ea, eb) = interval;
     if !(ea < emax && emax < eb) {
-        return Err(ActError::ProtocolError("Emax not inside revocation gap".into()));
+        return Err(ActError::ProtocolError(
+            "Emax not inside revocation gap".into(),
+        ));
     }
     if eb <= ea {
         return Err(ActError::ProtocolError("invalid revocation gap".into()));
@@ -76,7 +80,7 @@ pub fn prove_emax_not_revoked(
     // The v3 proof does not yet consume ctx internally; callers must also bind
     // ctx into the EBUT outer transcript. This wrapper keeps the context visible
     // at the API boundary so it cannot be forgotten by the upload/refresh layer.
-    Ok(create_non_membership_proof_timed(
+    create_non_membership_proof_timed(
         inputs.emax,
         inputs.r1_emax,
         inputs.r2_emax,
@@ -87,7 +91,7 @@ pub fn prove_emax_not_revoked(
         inputs.r2_eb,
         inputs.r1_ea,
         inputs.r1_eb,
-    ))
+    )
 }
 
 /// Verify v1 non-membership proof. This verifies the proof equations and also
@@ -99,10 +103,16 @@ pub fn verify_emax_not_revoked(
     user_com_rist: RistrettoPoint,
     user_com_bls: G1Projective,
 ) -> Result<()> {
-    let (ok, _timing) = verify_non_membership_proof_timed(proof, server_pk, user_com_rist, user_com_bls);
-    if ok { Ok(()) } else { Err(ActError::VerificationFailed("revocation gap proof failed".into())) }
+    let (ok, _timing) =
+        verify_non_membership_proof_timed(proof, server_pk, user_com_rist, user_com_bls);
+    if ok {
+        Ok(())
+    } else {
+        Err(ActError::VerificationFailed(
+            "revocation gap proof failed".into(),
+        ))
+    }
 }
-
 
 /// Verify that the hidden `Emax` proven by a refresh proof is not revoked.
 ///
@@ -117,7 +127,13 @@ pub fn verify_refresh_not_revoked(
     user_com_rist: RistrettoPoint,
 ) -> Result<()> {
     let user_com_bls = refresh_emax_bls_commitment(refresh_proof, ctx.now_unix, generators);
-    verify_emax_not_revoked(ctx, revocation_proof, server_pk, user_com_rist, user_com_bls)
+    verify_emax_not_revoked(
+        ctx,
+        revocation_proof,
+        server_pk,
+        user_com_rist,
+        user_com_bls,
+    )
 }
 
 /// Verify that the hidden `Emax` proven by a spend proof is not revoked.
@@ -133,5 +149,11 @@ pub fn verify_spend_not_revoked(
     user_com_rist: RistrettoPoint,
 ) -> Result<()> {
     let user_com_bls = spend_emax_bls_commitment(spend_proof, ctx.now_unix, generators);
-    verify_emax_not_revoked(ctx, revocation_proof, server_pk, user_com_rist, user_com_bls)
+    verify_emax_not_revoked(
+        ctx,
+        revocation_proof,
+        server_pk,
+        user_com_rist,
+        user_com_bls,
+    )
 }
